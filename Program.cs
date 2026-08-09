@@ -44,6 +44,15 @@ internal static class Program
         {
             await MainMenu.RunAsync(adapterService);
         }
+        catch (Exception ex)
+        {
+            Console.WriteLine();
+            ConsoleTheme.WriteError("Adapter Manager hit an unexpected error and needs to close:");
+            ConsoleTheme.WriteError(ex.Message);
+            Console.WriteLine();
+            ConsoleTheme.WriteMuted("Press any key to exit...");
+            Console.ReadKey(true);
+        }
         finally
         {
             Console.CursorVisible = true;

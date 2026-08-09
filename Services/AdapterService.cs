@@ -1,10 +1,10 @@
-﻿using System.Diagnostics;
+﻿using NetworkAdapterManager.Models;
+using System.Diagnostics;
 using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Principal;
-using NetworkAdapterManager.Models;
 
 namespace NetworkAdapterManager.Services;
 
@@ -15,8 +15,17 @@ namespace NetworkAdapterManager.Services;
 /// </summary>
 public sealed class AdapterService
 {
+    // Used for reading adapter info. A narrow column list is faster to enumerate, but WMI
+    // objects returned from it must NOT have InvokeMethod called on them -- see below.
     private const string WmiAdapterQuery =
         "SELECT Name, NetConnectionID, NetEnabled, GUID FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL";
+
+    // Used anywhere we're about to call InvokeMethod (Enable/Disable). WMI objects fetched
+    // via a narrowed column SELECT are not fully "bound" and throw InvalidOperationException
+    // ("Operation is not valid due to the current state of the object") if you try to invoke
+    // a method on them -- SELECT * is required for that to work reliably.
+    private const string WmiAdapterMutationQuery =
+        "SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL";
 
     // Windows interface metrics: lower wins. 1 is effectively "most preferred"; 9999 is the
     // practical ceiling, well above any automatically-computed metric, so it always loses.
@@ -62,17 +71,21 @@ public sealed class AdapterService
                 var ipv4 = GetIPv4Address(nic);
                 var ifIndex = GetIPv4InterfaceIndex(nic);
 
-                // "Has Internet" is answered by asking Windows' own routing table whether
-                // THIS adapter's interface has a route that would carry traffic to a public
-                // address -- not by testing reachability ourselves, and not by looking only
-                // for a classic DHCP gateway. That matters for two reasons:
-                //  1. It is per-adapter and reads real OS state, so it stays correct no
-                //     matter which adapter is currently preferred for outbound traffic.
-                //  2. It also recognizes VPN tunnel adapters, which typically don't set a
-                //     conventional gateway at all -- they add routes directly (often as two
-                //     half-ranges covering the whole address space) to avoid clashing with
-                //     the physical adapter's default route.
-                var hasInternet = enabled && ifIndex is int index && internetCapableIndexes.Contains(index);
+                // "Has Internet" is primarily read from THIS adapter's own IP configuration --
+                // does it have a real IPv4 address and a default gateway? That is intrinsic to
+                // the adapter itself (set by DHCP or static config) and does NOT change based
+                // on interface metric or which adapter Windows currently prefers, so it stays
+                // correct no matter how many times you switch back and forth between two
+                // physically-connected adapters.
+                //
+                // Some adapters -- most VPN tunnel clients -- never set a conventional gateway
+                // at all; they add routes directly instead (often as two half-ranges covering
+                // the whole address space). For those, and only when no gateway is present, we
+                // fall back to asking the routing table whether this adapter's interface has a
+                // route that would carry traffic to a public address.
+                var hasGateway = HasDefaultGateway(nic);
+                var hasRouteToInternet = ifIndex is int index && internetCapableIndexes.Contains(index);
+                var hasInternet = enabled && ipv4 is not null && (hasGateway || hasRouteToInternet);
 
                 var isActive = enabled && activeLocalAddress is not null &&
                                ipv4 is not null && ipv4.Equals(activeLocalAddress);
@@ -134,20 +147,20 @@ public sealed class AdapterService
 
     private static Task SetAllAdaptersStateAsync(bool enable) => Task.Run(() =>
     {
-        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
+        using var searcher = new ManagementObjectSearcher(WmiAdapterMutationQuery);
         using var found = searcher.Get();
         foreach (ManagementObject adapter in found)
         {
             using (adapter)
             {
-                adapter.InvokeMethod(enable ? "Enable" : "Disable", null);
+                TryInvokeAdapterMethod(adapter, enable ? "Enable" : "Disable");
             }
         }
     });
 
     private static Task EnableAdapterAsync(string guid) => Task.Run(() =>
     {
-        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
+        using var searcher = new ManagementObjectSearcher(WmiAdapterMutationQuery);
         using var found = searcher.Get();
         foreach (ManagementObject adapter in found)
         {
@@ -155,12 +168,32 @@ public sealed class AdapterService
             {
                 if (string.Equals(adapter["GUID"]?.ToString(), guid, StringComparison.OrdinalIgnoreCase))
                 {
-                    adapter.InvokeMethod("Enable", null);
+                    TryInvokeAdapterMethod(adapter, "Enable");
                     break;
                 }
             }
         }
     });
+
+    /// <summary>
+    /// Calls an Enable/Disable WMI method and swallows failures instead of letting them
+    /// propagate -- a single adapter that WMI can't currently operate on (e.g. mid state
+    /// change, or a virtual adapter that doesn't support the operation) should not crash
+    /// the whole app.
+    /// </summary>
+    private static void TryInvokeAdapterMethod(ManagementObject adapter, string methodName)
+    {
+        try
+        {
+            adapter.InvokeMethod(methodName, null);
+        }
+        catch (ManagementException)
+        {
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
 
     /// <summary>Waits until an adapter reappears at the IP level after being enabled.</summary>
     private static async Task WaitForAdapterReadyAsync(string guid, TimeSpan timeout)
@@ -285,6 +318,13 @@ public sealed class AdapterService
         }
 
         return indexes;
+    }
+
+    private static bool HasDefaultGateway(NetworkInterface? nic)
+    {
+        return nic?.GetIPProperties().GatewayAddresses
+            .Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any))
+            ?? false;
     }
 
     private static int? GetIPv4InterfaceIndex(NetworkInterface? nic)
