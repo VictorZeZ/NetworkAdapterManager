@@ -30,11 +30,16 @@ internal static class SwitchAdapterFlow
             if (!adapter.HasInternet)
                 label += "  (No Internet)";
 
-            var color = adapter.IsActive
-                ? ConsoleColor.Yellow
-                : adapter.HasInternet
-                    ? ConsoleColor.Green
-                    : ConsoleColor.DarkGray;
+            if (adapter.IsActive && !adapter.HasInternet)
+                label += " \u2014 this is why you're offline right now; pick an adapter with Internet access instead.";
+
+            var color = (adapter.IsActive, adapter.HasInternet) switch
+            {
+                (true, true) => ConsoleColor.Green,    // active and online
+                (false, true) => ConsoleColor.Yellow,  // online, but not the active one
+                (true, false) => ConsoleColor.Red,     // active, but no Internet
+                (false, false) => ConsoleColor.DarkGray // neither active nor online
+            };
 
             entries.Add(new MenuEntry(label, color));
         }
@@ -51,12 +56,22 @@ internal static class SwitchAdapterFlow
         Console.Clear();
         ConsoleTheme.WriteTitle("SWITCH NETWORK ADAPTER");
         Console.WriteLine();
-        Console.WriteLine($"Switching to \"{selected.Name}\"...");
+        Console.WriteLine($"Making \"{selected.Name}\" the preferred adapter...");
 
-        await adapterService.SwitchToAdapterAsync(selected);
+        var success = await adapterService.SwitchToAdapterAsync(selected);
 
         Console.WriteLine();
-        ConsoleTheme.WriteSuccess($"\"{selected.Name}\" is now the active adapter.");
+        if (success)
+        {
+            ConsoleTheme.WriteSuccess($"\"{selected.Name}\" is now the active adapter.");
+            ConsoleTheme.WriteMuted("Other adapters stay connected; they're just no longer preferred.");
+        }
+        else
+        {
+            ConsoleTheme.WriteWarning($"\"{selected.Name}\" may not have switched correctly.");
+            ConsoleTheme.WriteMuted("Make sure Adapter Manager is running as Administrator and try again.");
+        }
+
         ConsoleTheme.WriteMuted("Press any key to continue...");
         Console.ReadKey(true);
     }

@@ -1,21 +1,29 @@
-﻿using NetworkAdapterManager.Models;
+﻿using System.Diagnostics;
 using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Principal;
+using NetworkAdapterManager.Models;
 
 namespace NetworkAdapterManager.Services;
 
 /// <summary>
-/// Reads and controls network adapters on Windows using WMI (Win32_NetworkAdapter)
-/// for identity/enable-disable, and System.Net.NetworkInformation for IP details.
+/// Reads and controls network adapters on Windows using WMI (Win32_NetworkAdapter) for
+/// identity/enable-disable, the Windows routing table for connectivity, and
+/// System.Net.NetworkInformation for IP details.
 /// </summary>
 public sealed class AdapterService
 {
+    private const string WmiAdapterQuery =
+        "SELECT Name, NetConnectionID, NetEnabled, GUID FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL";
+
+    // Windows interface metrics: lower wins. 1 is effectively "most preferred"; 9999 is the
+    // practical ceiling, well above any automatically-computed metric, so it always loses.
+    private const int PreferredMetric = 1;
+    private const int DeprioritizedMetric = 9999;
+
     private static readonly IPAddress ProbeAddress = IPAddress.Parse("1.1.1.1");
-    private const int ProbePort = 443;
-    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(2);
 
     public static bool IsRunningAsAdministrator()
     {
@@ -25,66 +33,61 @@ public sealed class AdapterService
     }
 
     /// <summary>
-    /// Returns all physical/virtual adapters that Windows exposes as a network connection,
-    /// sorted with Internet-capable adapters first and disconnected ones last.
+    /// Returns all adapters that Windows exposes as a network connection, sorted with
+    /// Internet-capable adapters first and disconnected ones last.
     /// </summary>
-    public async Task<List<NetworkAdapterInfo>> GetAdaptersAsync()
+    public Task<List<NetworkAdapterInfo>> GetAdaptersAsync() => Task.Run(() =>
     {
         var activeLocalAddress = GetActiveLocalAddress();
+        var internetCapableIndexes = GetInternetCapableInterfaceIndexes();
 
-        using var searcher = new ManagementObjectSearcher("SELECT Name, NetConnectionID, NetEnabled, GUID FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL");
-
+        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
         using var wmiResults = searcher.Get();
         var wmiAdapters = wmiResults.Cast<ManagementObject>().ToList();
 
         var nicsByGuid = NetworkInterface.GetAllNetworkInterfaces()
             .ToDictionary(nic => nic.Id, nic => nic, StringComparer.OrdinalIgnoreCase);
 
-        // Only actively probe enabled adapters that have an IPv4 address.
-        var probeTasks = new List<Task<(string Guid, bool HasInternet)>>();
-        foreach (var wmiAdapter in wmiAdapters)
-        {
-            var guid = wmiAdapter["GUID"]?.ToString();
-            var enabled = wmiAdapter["NetEnabled"] is true;
-
-            if (guid is null || !enabled || !nicsByGuid.TryGetValue(guid, out var nic))
-                continue;
-
-            var ipv4 = GetIPv4Address(nic);
-            if (ipv4 is null)
-                continue;
-
-            probeTasks.Add(ProbeInternetAsync(guid, ipv4));
-        }
-
-        var internetByGuid = (await Task.WhenAll(probeTasks))
-            .ToDictionary(r => r.Guid, r => r.HasInternet, StringComparer.OrdinalIgnoreCase);
-
         var results = new List<NetworkAdapterInfo>();
         foreach (var wmiAdapter in wmiAdapters)
         {
-            var guid = wmiAdapter["GUID"]?.ToString() ?? string.Empty;
-            var name = wmiAdapter["NetConnectionID"]?.ToString() ?? "(Unknown adapter)";
-            var enabled = wmiAdapter["NetEnabled"] is true;
-
-            nicsByGuid.TryGetValue(guid, out var nic);
-            var description = nic?.Description ?? "No driver information available";
-            var ipv4 = GetIPv4Address(nic);
-
-            var hasInternet = enabled && internetByGuid.GetValueOrDefault(guid, false);
-            var isActive = enabled && activeLocalAddress is not null &&
-                           ipv4 is not null && ipv4.Equals(activeLocalAddress);
-
-            results.Add(new NetworkAdapterInfo
+            using (wmiAdapter)
             {
-                Id = guid,
-                Name = name,
-                Description = description,
-                IsEnabled = enabled,
-                HasInternet = hasInternet,
-                IsActive = isActive,
-                IPv4Address = ipv4?.ToString()
-            });
+                var guid = wmiAdapter["GUID"]?.ToString() ?? string.Empty;
+                var name = wmiAdapter["NetConnectionID"]?.ToString() ?? "(Unknown adapter)";
+                var enabled = wmiAdapter["NetEnabled"] is true;
+
+                nicsByGuid.TryGetValue(guid, out var nic);
+                var description = nic?.Description ?? "No driver information available";
+                var ipv4 = GetIPv4Address(nic);
+                var ifIndex = GetIPv4InterfaceIndex(nic);
+
+                // "Has Internet" is answered by asking Windows' own routing table whether
+                // THIS adapter's interface has a route that would carry traffic to a public
+                // address -- not by testing reachability ourselves, and not by looking only
+                // for a classic DHCP gateway. That matters for two reasons:
+                //  1. It is per-adapter and reads real OS state, so it stays correct no
+                //     matter which adapter is currently preferred for outbound traffic.
+                //  2. It also recognizes VPN tunnel adapters, which typically don't set a
+                //     conventional gateway at all -- they add routes directly (often as two
+                //     half-ranges covering the whole address space) to avoid clashing with
+                //     the physical adapter's default route.
+                var hasInternet = enabled && ifIndex is int index && internetCapableIndexes.Contains(index);
+
+                var isActive = enabled && activeLocalAddress is not null &&
+                               ipv4 is not null && ipv4.Equals(activeLocalAddress);
+
+                results.Add(new NetworkAdapterInfo
+                {
+                    Id = guid,
+                    Name = name,
+                    Description = description,
+                    IsEnabled = enabled,
+                    HasInternet = hasInternet,
+                    IsActive = isActive,
+                    IPv4Address = ipv4?.ToString()
+                });
+            }
         }
 
         return results
@@ -92,27 +95,38 @@ public sealed class AdapterService
             .ThenByDescending(a => a.IsActive)
             .ThenBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
-    }
+    });
 
     /// <summary>
-    /// Makes <paramref name="target"/> the sole active adapter: enables it and
-    /// disables every other adapter Windows knows about.
+    /// Makes <paramref name="target"/> the system's preferred adapter for outbound traffic by
+    /// giving it the lowest interface metric and deprioritizing every other adapter. Unlike an
+    /// earlier version of this method, it does NOT disable other adapters -- on a machine with
+    /// two independent Internet connections (e.g. a wired modem and a tethered phone), both
+    /// should stay connected; only which one Windows prefers should change. Returns false if
+    /// any of the underlying `netsh` calls failed (most commonly because the app isn't
+    /// elevated).
     /// </summary>
-    public Task SwitchToAdapterAsync(NetworkAdapterInfo target) => Task.Run(() =>
+    public async Task<bool> SwitchToAdapterAsync(NetworkAdapterInfo target)
     {
-        using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL");
-
-        using var found = searcher.Get();
-        foreach (ManagementObject adapter in found)
+        if (!target.IsEnabled)
         {
-            using (adapter)
-            {
-                var guid = adapter["GUID"]?.ToString();
-                var isTarget = string.Equals(guid, target.Id, StringComparison.OrdinalIgnoreCase);
-                adapter.InvokeMethod(isTarget ? "Enable" : "Disable", null);
-            }
+            await EnableAdapterAsync(target.Id);
+            await WaitForAdapterReadyAsync(target.Id, TimeSpan.FromSeconds(5));
         }
-    });
+
+        var success = true;
+        foreach (var name in GetManagedAdapterNames())
+        {
+            var metric = string.Equals(name, target.Name, StringComparison.OrdinalIgnoreCase)
+                ? PreferredMetric
+                : DeprioritizedMetric;
+
+            if (!await SetInterfaceMetricAsync(name, metric))
+                success = false;
+        }
+
+        return success;
+    }
 
     public Task EnableAllAdaptersAsync() => SetAllAdaptersStateAsync(enable: true);
 
@@ -120,8 +134,7 @@ public sealed class AdapterService
 
     private static Task SetAllAdaptersStateAsync(bool enable) => Task.Run(() =>
     {
-        using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL");
-
+        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
         using var found = searcher.Get();
         foreach (ManagementObject adapter in found)
         {
@@ -131,6 +144,85 @@ public sealed class AdapterService
             }
         }
     });
+
+    private static Task EnableAdapterAsync(string guid) => Task.Run(() =>
+    {
+        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
+        using var found = searcher.Get();
+        foreach (ManagementObject adapter in found)
+        {
+            using (adapter)
+            {
+                if (string.Equals(adapter["GUID"]?.ToString(), guid, StringComparison.OrdinalIgnoreCase))
+                {
+                    adapter.InvokeMethod("Enable", null);
+                    break;
+                }
+            }
+        }
+    });
+
+    /// <summary>Waits until an adapter reappears at the IP level after being enabled.</summary>
+    private static async Task WaitForAdapterReadyAsync(string guid, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var ready = NetworkInterface.GetAllNetworkInterfaces()
+                .Any(nic => string.Equals(nic.Id, guid, StringComparison.OrdinalIgnoreCase));
+            if (ready)
+                return;
+
+            await Task.Delay(250);
+        }
+    }
+
+    private static List<string> GetManagedAdapterNames()
+    {
+        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
+        using var found = searcher.Get();
+
+        var names = new List<string>();
+        foreach (ManagementObject adapter in found)
+        {
+            using (adapter)
+            {
+                var name = adapter["NetConnectionID"]?.ToString();
+                if (!string.IsNullOrEmpty(name))
+                    names.Add(name);
+            }
+        }
+
+        return names;
+    }
+
+    /// <summary>Sets an adapter's IPv4 interface metric via netsh. Requires Administrator.</summary>
+    private static async Task<bool> SetInterfaceMetricAsync(string interfaceName, int metric)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "netsh",
+            Arguments = $"interface ipv4 set interface interface=\"{interfaceName}\" metric={metric}",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process is null)
+                return false;
+
+            await process.WaitForExitAsync();
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// Determines the local IPv4 address currently used for outbound traffic by opening
@@ -152,24 +244,61 @@ public sealed class AdapterService
     }
 
     /// <summary>
-    /// Tests real Internet reachability from a specific adapter by binding a TCP connection
-    /// to its local address and attempting to reach a public host, with a short timeout.
+    /// Reads the live IPv4 routing table (via MSFT_NetRoute) and returns the set of interface
+    /// indexes that have a route covering <see cref="ProbeAddress"/> -- i.e. adapters that are
+    /// actually configured to carry traffic to the public internet, regardless of how that
+    /// route was installed (DHCP gateway, static route, or a VPN client's split-tunnel routes).
     /// </summary>
-    private static async Task<(string Guid, bool HasInternet)> ProbeInternetAsync(string guid, IPAddress localAddress)
+    private static HashSet<int> GetInternetCapableInterfaceIndexes()
     {
+        var indexes = new HashSet<int>();
+
         try
         {
-            using var client = new TcpClient(new IPEndPoint(localAddress, 0));
-            var connectTask = client.ConnectAsync(ProbeAddress, ProbePort);
-            var timeoutTask = Task.Delay(ProbeTimeout);
+            using var searcher = new ManagementObjectSearcher(
+                @"root\StandardCimv2",
+                "SELECT InterfaceIndex, DestinationPrefix FROM MSFT_NetRoute WHERE AddressFamily = 2");
 
-            var finished = await Task.WhenAny(connectTask, timeoutTask);
-            var success = finished == connectTask && client.Connected;
-            return (guid, success);
+            using var routes = searcher.Get();
+            foreach (ManagementBaseObject route in routes)
+            {
+                using (route)
+                {
+                    var prefixText = route["DestinationPrefix"]?.ToString();
+                    var ifIndexValue = route["InterfaceIndex"];
+
+                    if (string.IsNullOrEmpty(prefixText) || ifIndexValue is null)
+                        continue;
+
+                    if (!IPNetwork.TryParse(prefixText, out var network))
+                        continue;
+
+                    if (network.Contains(ProbeAddress))
+                        indexes.Add(Convert.ToInt32(ifIndexValue));
+                }
+            }
         }
-        catch
+        catch (ManagementException)
         {
-            return (guid, false);
+            // MSFT_NetRoute unavailable on this system -- adapters will conservatively show
+            // as offline rather than the app guessing incorrectly.
+        }
+
+        return indexes;
+    }
+
+    private static int? GetIPv4InterfaceIndex(NetworkInterface? nic)
+    {
+        if (nic is null)
+            return null;
+
+        try
+        {
+            return nic.GetIPProperties().GetIPv4Properties()?.Index;
+        }
+        catch (NetworkInformationException)
+        {
+            return null;
         }
     }
 
