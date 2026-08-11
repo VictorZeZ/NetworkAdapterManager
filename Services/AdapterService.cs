@@ -1,5 +1,5 @@
 ﻿using NetworkAdapterManager.Models;
-using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -20,19 +20,24 @@ public sealed class AdapterService
     private const string WmiAdapterQuery =
         "SELECT Name, NetConnectionID, NetEnabled, GUID FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL";
 
-    // Used anywhere we're about to call InvokeMethod (Enable/Disable). WMI objects fetched
+    // Used whenever we're about to call InvokeMethod (Enable/Disable). WMI objects fetched
     // via a narrowed column SELECT are not fully "bound" and throw InvalidOperationException
     // ("Operation is not valid due to the current state of the object") if you try to invoke
     // a method on them -- SELECT * is required for that to work reliably.
     private const string WmiAdapterMutationQuery =
         "SELECT * FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL";
 
-    // Windows interface metrics: lower wins. 1 is effectively "most preferred"; 9999 is the
-    // practical ceiling, well above any automatically-computed metric, so it always loses.
-    private const int PreferredMetric = 1;
-    private const int DeprioritizedMetric = 9999;
-
     private static readonly IPAddress ProbeAddress = IPAddress.Parse("1.1.1.1");
+
+    // Remembers the last HasInternet value observed for each adapter WHILE it was enabled,
+    // keyed by GUID. A disabled adapter has no IP configuration left to inspect (no gateway,
+    // no routes), so this is the only way to answer "did this adapter have Internet before
+    // we/you disabled it?" -- it's populated every time GetAdaptersAsync sees the adapter
+    // enabled, which reliably covers adapters this app itself switches away from (we always
+    // scan them enabled immediately before disabling them). It resets when the app restarts,
+    // and an adapter that was already disabled before the app ever saw it enabled will
+    // correctly show as "unknown" rather than a guess.
+    private readonly ConcurrentDictionary<string, bool> _lastKnownInternetByGuid = new(StringComparer.OrdinalIgnoreCase);
 
     public static bool IsRunningAsAdministrator()
     {
@@ -73,10 +78,8 @@ public sealed class AdapterService
 
                 // "Has Internet" is primarily read from THIS adapter's own IP configuration --
                 // does it have a real IPv4 address and a default gateway? That is intrinsic to
-                // the adapter itself (set by DHCP or static config) and does NOT change based
-                // on interface metric or which adapter Windows currently prefers, so it stays
-                // correct no matter how many times you switch back and forth between two
-                // physically-connected adapters.
+                // the adapter itself (set by DHCP or static config), independent of anything
+                // else on the system.
                 //
                 // Some adapters -- most VPN tunnel clients -- never set a conventional gateway
                 // at all; they add routes directly instead (often as two half-ranges covering
@@ -86,6 +89,13 @@ public sealed class AdapterService
                 var hasGateway = HasDefaultGateway(nic);
                 var hasRouteToInternet = ifIndex is int index && internetCapableIndexes.Contains(index);
                 var hasInternet = enabled && ipv4 is not null && (hasGateway || hasRouteToInternet);
+
+                if (enabled && !string.IsNullOrEmpty(guid))
+                    _lastKnownInternetByGuid[guid] = hasInternet;
+
+                var lastKnownHasInternet = !string.IsNullOrEmpty(guid) && _lastKnownInternetByGuid.TryGetValue(guid, out var known)
+                    ? known
+                    : (bool?)null;
 
                 var isActive = enabled && activeLocalAddress is not null &&
                                ipv4 is not null && ipv4.Equals(activeLocalAddress);
@@ -97,6 +107,7 @@ public sealed class AdapterService
                     Description = description,
                     IsEnabled = enabled,
                     HasInternet = hasInternet,
+                    LastKnownHasInternet = lastKnownHasInternet,
                     IsActive = isActive,
                     IPv4Address = ipv4?.ToString()
                 });
@@ -111,35 +122,41 @@ public sealed class AdapterService
     });
 
     /// <summary>
-    /// Makes <paramref name="target"/> the system's preferred adapter for outbound traffic by
-    /// giving it the lowest interface metric and deprioritizing every other adapter. Unlike an
-    /// earlier version of this method, it does NOT disable other adapters -- on a machine with
-    /// two independent Internet connections (e.g. a wired modem and a tethered phone), both
-    /// should stay connected; only which one Windows prefers should change. Returns false if
-    /// any of the underlying `netsh` calls failed (most commonly because the app isn't
-    /// elevated).
+    /// Makes <paramref name="target"/> the sole active adapter: enables it and disables every
+    /// other adapter Windows knows about. Returns whether the whole operation succeeded.
+    ///
+    /// The target is enabled FIRST, and we wait for it to actually come online (a real IPv4
+    /// address, not just the administrative "enabled" flag) before touching anything else. If
+    /// we disabled every other adapter before confirming the target was back up, a failure or
+    /// delay bringing it online would leave the system with nothing enabled at all. If the
+    /// target doesn't come online in time, nothing else is touched and this returns false.
     /// </summary>
-    public async Task<bool> SwitchToAdapterAsync(NetworkAdapterInfo target)
+    public Task<bool> SwitchToAdapterAsync(NetworkAdapterInfo target) => Task.Run(async () =>
     {
-        if (!target.IsEnabled)
+        if (!TryEnableAdapterByGuid(target.Id, out _))
+            return false;
+
+        if (!await WaitForAdapterOnlineAsync(target.Id, TimeSpan.FromSeconds(8)))
+            return false;
+
+        using var searcher = new ManagementObjectSearcher(WmiAdapterMutationQuery);
+        using var found = searcher.Get();
+        var allSucceeded = true;
+        foreach (ManagementObject adapter in found)
         {
-            await EnableAdapterAsync(target.Id);
-            await WaitForAdapterReadyAsync(target.Id, TimeSpan.FromSeconds(5));
+            using (adapter)
+            {
+                var guid = adapter["GUID"]?.ToString();
+                if (string.Equals(guid, target.Id, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!TryInvokeAdapterMethod(adapter, "Disable", out _))
+                    allSucceeded = false;
+            }
         }
 
-        var success = true;
-        foreach (var name in GetManagedAdapterNames())
-        {
-            var metric = string.Equals(name, target.Name, StringComparison.OrdinalIgnoreCase)
-                ? PreferredMetric
-                : DeprioritizedMetric;
-
-            if (!await SetInterfaceMetricAsync(name, metric))
-                success = false;
-        }
-
-        return success;
-    }
+        return allSucceeded;
+    });
 
     public Task EnableAllAdaptersAsync() => SetAllAdaptersStateAsync(enable: true);
 
@@ -153,12 +170,12 @@ public sealed class AdapterService
         {
             using (adapter)
             {
-                TryInvokeAdapterMethod(adapter, enable ? "Enable" : "Disable");
+                TryInvokeAdapterMethod(adapter, enable ? "Enable" : "Disable", out _);
             }
         }
     });
 
-    private static Task EnableAdapterAsync(string guid) => Task.Run(() =>
+    private static bool TryEnableAdapterByGuid(string guid, out string? error)
     {
         using var searcher = new ManagementObjectSearcher(WmiAdapterMutationQuery);
         using var found = searcher.Get();
@@ -167,94 +184,67 @@ public sealed class AdapterService
             using (adapter)
             {
                 if (string.Equals(adapter["GUID"]?.ToString(), guid, StringComparison.OrdinalIgnoreCase))
-                {
-                    TryInvokeAdapterMethod(adapter, "Enable");
-                    break;
-                }
+                    return TryInvokeAdapterMethod(adapter, "Enable", out error);
             }
         }
-    });
+
+        error = "adapter not found";
+        return false;
+    }
 
     /// <summary>
-    /// Calls an Enable/Disable WMI method and swallows failures instead of letting them
-    /// propagate -- a single adapter that WMI can't currently operate on (e.g. mid state
-    /// change, or a virtual adapter that doesn't support the operation) should not crash
-    /// the whole app.
+    /// Calls an Enable/Disable WMI method and reports whether it actually succeeded -- both by
+    /// catching exceptions AND by checking the method's ReturnValue. WMI can report a logical
+    /// failure (e.g. access denied, or the adapter being mid state-change) through ReturnValue
+    /// without throwing at all, so checking only for exceptions -- as earlier versions of this
+    /// method did -- can silently miss a real failure and report success incorrectly.
     /// </summary>
-    private static void TryInvokeAdapterMethod(ManagementObject adapter, string methodName)
+    private static bool TryInvokeAdapterMethod(ManagementObject adapter, string methodName, out string? error)
     {
         try
         {
-            adapter.InvokeMethod(methodName, null);
+            using var result = adapter.InvokeMethod(methodName, null) as ManagementBaseObject;
+            var returnValue = result is null ? (uint?)null : Convert.ToUInt32(result["ReturnValue"]);
+
+            // 0 = success, 1 = success but a reboot is required. Anything else is a real
+            // failure even though InvokeMethod itself didn't throw.
+            if (returnValue is null or 0 or 1)
+            {
+                error = null;
+                return true;
+            }
+
+            error = $"WMI returned code {returnValue}";
+            return false;
         }
-        catch (ManagementException)
+        catch (ManagementException ex)
         {
+            error = ex.Message;
+            return false;
         }
-        catch (InvalidOperationException)
+        catch (InvalidOperationException ex)
         {
+            error = ex.Message;
+            return false;
         }
     }
 
-    /// <summary>Waits until an adapter reappears at the IP level after being enabled.</summary>
-    private static async Task WaitForAdapterReadyAsync(string guid, TimeSpan timeout)
+    /// <summary>Waits until an adapter has a real IPv4 address -- i.e. is actually usable, not just administratively enabled.</summary>
+    private static async Task<bool> WaitForAdapterOnlineAsync(string guid, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
-            var ready = NetworkInterface.GetAllNetworkInterfaces()
-                .Any(nic => string.Equals(nic.Id, guid, StringComparison.OrdinalIgnoreCase));
-            if (ready)
-                return;
+            var nic = NetworkInterface.GetAllNetworkInterfaces()
+                .FirstOrDefault(n => string.Equals(n.Id, guid, StringComparison.OrdinalIgnoreCase));
+
+            if (GetIPv4Address(nic) is not null)
+                return true;
 
             await Task.Delay(250);
         }
-    }
 
-    private static List<string> GetManagedAdapterNames()
-    {
-        using var searcher = new ManagementObjectSearcher(WmiAdapterQuery);
-        using var found = searcher.Get();
-
-        var names = new List<string>();
-        foreach (ManagementObject adapter in found)
-        {
-            using (adapter)
-            {
-                var name = adapter["NetConnectionID"]?.ToString();
-                if (!string.IsNullOrEmpty(name))
-                    names.Add(name);
-            }
-        }
-
-        return names;
-    }
-
-    /// <summary>Sets an adapter's IPv4 interface metric via netsh. Requires Administrator.</summary>
-    private static async Task<bool> SetInterfaceMetricAsync(string interfaceName, int metric)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = "netsh",
-            Arguments = $"interface ipv4 set interface interface=\"{interfaceName}\" metric={metric}",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-
-        try
-        {
-            using var process = Process.Start(startInfo);
-            if (process is null)
-                return false;
-
-            await process.WaitForExitAsync();
-            return process.ExitCode == 0;
-        }
-        catch
-        {
-            return false;
-        }
+        return false;
     }
 
     /// <summary>

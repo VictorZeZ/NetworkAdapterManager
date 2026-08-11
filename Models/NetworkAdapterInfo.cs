@@ -21,6 +21,15 @@ public sealed record NetworkAdapterInfo
     /// <summary>Whether this adapter currently has working Internet access.</summary>
     public required bool HasInternet { get; init; }
 
+    /// <summary>
+    /// The last HasInternet value observed for this adapter while it was enabled, or null if
+    /// it has never been seen enabled during this app session. Only meaningful when the
+    /// adapter is currently disabled -- a disabled adapter has no IP configuration to read,
+    /// so this is what lets the switch menu show "this one is off, but it did have Internet"
+    /// instead of treating every disabled adapter identically.
+    /// </summary>
+    public bool? LastKnownHasInternet { get; init; }
+
     /// <summary>Whether this adapter is the one the system currently uses for outbound traffic.</summary>
     public required bool IsActive { get; init; }
 
